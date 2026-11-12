@@ -268,7 +268,7 @@ body.screen .bar{height:12px}
   <div class="sb-grid" id="sb"></div>
   <div class="lbl" style="margin-top:28px">Əməliyyat tarixçəsi</div>
   <div class="log" id="log"></div>
-  <p style="color:var(--dim);font-size:13px;margin-top:14px">Hər komanda 100 xalla başlayır. Xallar bütün supervayzerlər arasında hər 3 saniyədən bir sinxronlaşır. Eyni hadisəyə görə xal bir dəfə verilir.</p>
+  <p style="color:var(--dim);font-size:13px;margin-top:14px">Hər komanda 100 xalla başlayır. Xallar bütün supervayzerlər arasında canlı sinxronlaşır. Eyni hadisəyə görə xal bir dəfə verilir.</p>
 </main>
 <script>
 const TEAMS=[
@@ -360,21 +360,43 @@ $('gateForm').addEventListener('submit',async e=>{
 });
 $('logout').onclick=()=>{ls.del(LS);location.reload()};
 
-// ===== shared state (JSONBlob, polled) =====
-const BASE='https://jsonblob.com/api/jsonBlob';
-const validId=x=>/^[A-Za-z0-9-]{6,64}$/.test(x||'');
-let BLOB_ID=(location.hash||'').replace(/^#/,'');
-if(!validId(BLOB_ID)){BLOB_ID=ls.get('vtc-board')||''}
-if(!validId(BLOB_ID))BLOB_ID='';
-let API=BASE+'/'+BLOB_ID;
-function setBoard(id){BLOB_ID=id;API=BASE+'/'+id;ls.set('vtc-board',id);if(location.hash!=='#'+id)history.replaceState(null,'','#'+id)}
-const POLL_MS=3000;
-let logs=[], resetAt=0, started=false, busy=false, lastOk=0;
-const visible=()=>logs.filter(x=>x.at>resetAt);
-function scores(){const s={};TEAMS.forEach(t=>s[t.id]=100);visible().forEach(x=>{if(s[x.t]!==undefined)s[x.t]+=x.v});return s}
+// ===== shared state: ntfy.sh topic as an append-only op log =====
+const NTFY='https://ntfy.sh/';
+const validId=x=>/^vtc-[a-z0-9]{20,40}$/.test(x||'');
+let TOPIC=(location.hash||'').replace(/^#/,'');
+if(!validId(TOPIC))TOPIC=ls.get('vtc-topic')||'';
+if(!validId(TOPIC))TOPIC='';
+const SNAP_EVERY=2*3600e3, SNAP_LAG=10*60e3;
+let ops={};             // opId -> op
+let logs=[], resetAt=0, base={}, snapAt=0, started=false, es=null, lastOk=0, connected=false;
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+const randTopic=()=>{let r='';const c='abcdefghijklmnopqrstuvwxyz0123456789';const a=new Uint8Array(28);try{crypto.getRandomValues(a)}catch(e){for(let i=0;i<28;i++)a[i]=Math.random()*256}a.forEach(x=>r+=c[x%36]);return 'vtc-'+r};
 const groups=[...new Set(OPTS.map(o=>o.g))];
 const optHtml=`<option value="">Səbəb seçin…</option>`+groups.map(g=>`<optgroup label="${g}">${OPTS.map((o,i)=>o.g===g?`<option value="${i}">${o.v>0?'+':'−'}${Math.abs(o.v)} · ${o.l}</option>`:'').join('')}</optgroup>`).join('');
 const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const TEAM_IDS=TEAMS.map(t=>t.id);
+function validOp(o){
+  if(!o||typeof o!=='object'||typeof o.id!=='string'||typeof o.at!=='number'||!isFinite(o.at))return false;
+  if(o.k==='a')return TEAM_IDS.includes(o.t)&&typeof o.v==='number'&&isFinite(o.v)&&Math.abs(o.v)<=100;
+  if(o.k==='d')return typeof o.ref==='string';
+  if(o.k==='s')return o.sc&&typeof o.sc==='object'&&TEAM_IDS.every(t=>typeof o.sc[t]==='number'&&isFinite(o.sc[t]));
+  return false;
+}
+function ingest(o){if(validOp(o)&&!ops[o.id]){ops[o.id]=o;return true}return false}
+function saveLocal(){try{localStorage.setItem('vtc-ops-'+TOPIC,JSON.stringify(Object.values(ops)))}catch(e){}}
+function fold(){
+  const all=Object.values(ops);
+  const snaps=all.filter(o=>o.k==='s').sort((a,b)=>b.at-a.at||(a.id<b.id?1:-1));
+  const S=snaps[0];
+  snapAt=S?S.at:0; resetAt=snapAt;
+  base={};TEAMS.forEach(t=>base[t.id]=S?S.sc[t.id]:100);
+  const del=new Set(all.filter(o=>o.k==='d').map(o=>o.ref));
+  logs=all.filter(o=>o.k==='a'&&o.at>snapAt&&!del.has(o.id)).sort((a,b)=>a.at-b.at);
+}
+const visible=()=>logs;
+function scores(){const s=Object.assign({},base);logs.forEach(x=>{s[x.t]+=x.v});return s}
+function scoresUpTo(T){const s=Object.assign({},base);logs.forEach(x=>{if(x.at<=T)s[x.t]+=x.v});return s}
+function refresh(){fold();render()}
 let last={}, lastSig='';
 function render(force){
   const sig=JSON.stringify([logs.map(x=>x.id).join(','),resetAt]);
@@ -398,42 +420,32 @@ function render(force){
 }
 function status(ok,txt){$('dot').classList.toggle('live',ok);$('stxt').textContent=txt}
 function banner(t){const b=$('banner');if(!t){b.classList.add('hidden');return}b.textContent=t;b.classList.remove('hidden')}
-function clean(d){
-  d=d&&typeof d==='object'?d:{};
-  const L=Array.isArray(d.logs)?d.logs.filter(x=>x&&typeof x.id==='string'&&typeof x.t==='string'&&typeof x.v==='number'&&isFinite(x.v)&&typeof x.at==='number'):[];
-  return {logs:L,resetAt:typeof d.resetAt==='number'?d.resetAt:0};
+function status(ok,txt){$('dot').classList.toggle('live',ok);$('stxt').textContent=txt}
+function banner(t){const b=$('banner');if(!t){b.classList.add('hidden');return}b.textContent=t;b.classList.remove('hidden')}
+
+async function publish(op){
+  ingest(op);saveLocal();refresh();
+  for(let i=0;i<3;i++){
+    try{
+      const r=await fetch(NTFY+TOPIC,{method:'POST',body:JSON.stringify(op)});
+      if(r.status===429){banner('Limitə çatıldı — bir neçə saniyə gözləyin.');await new Promise(z=>setTimeout(z,6000));continue}
+      if(!r.ok)throw new Error(r.status);
+      banner('');return true;
+    }catch(e){await new Promise(z=>setTimeout(z,1500*(i+1)))}
+  }
+  banner('Göndərilmədi — internet bağlantısını yoxlayın. Əməliyyat bu cihazda saxlanıb, bağlantı bərpa olunanda yenidən göndəriləcək.');
+  pending.push(op);return false;
 }
-async function fetchState(){
-  const r=await fetch(API,{headers:{'Accept':'application/json'},cache:'no-store'});
-  if(!r.ok)throw new Error('GET '+r.status);
-  return clean(await r.json());
+let pending=[];
+async function flushPending(){const p=pending;pending=[];for(const o of p){await publish(o)}}
+async function maybeSnapshot(){
+  const now=Date.now(), T=now-SNAP_LAG;
+  if(now-snapAt<SNAP_EVERY)return;
+  if(!logs.some(x=>x.at<=T))return;
+  await publish({k:'s',id:uid(),at:T,sc:scoresUpTo(T),by:me});
 }
-async function putState(d){
-  const r=await fetch(API,{method:'PUT',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(d)});
-  if(!r.ok)throw new Error('PUT '+r.status);
-}
-function apply(d){logs=d.logs;resetAt=d.resetAt;lastOk=Date.now();status(true,'Canlı · '+me);render()}
-async function mutate(fn,label){
-  while(busy)await new Promise(r=>setTimeout(r,150));
-  busy=true;
-  try{
-    for(let attempt=0;attempt<3;attempt++){
-      const d=await fetchState();
-      const ok=fn(d);
-      await putState(d);
-      await new Promise(r=>setTimeout(r,300+Math.random()*400));
-      const check=await fetchState();
-      if(ok(check)){apply(check);banner('');return}
-    }
-    banner('Əməliyyat təsdiqlənmədi — tarixçəni yoxlayın.');
-  }catch(e){banner('Bağlantı xətası: '+label+' alınmadı. Yenidən cəhd edin.');fetchState().then(apply).catch(()=>{})}
-  finally{busy=false}
-}
-const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
 function add(tid,v,label){
-  const e={id:uid(),t:tid,v,l:label,by:me,at:Date.now()};
-  logs=logs.concat([e]);render();
-  mutate(d=>{if(!d.logs.some(x=>x.id===e.id))d.logs.push(e);if(d.logs.length>2000)d.logs=d.logs.slice(-2000);return c=>c.logs.some(x=>x.id===e.id)},'xal');
+  publish({k:'a',id:uid(),t:tid,v:v,l:String(label).slice(0,120),by:me,at:Date.now()}).then(ok=>{if(ok)maybeSnapshot()});
 }
 $('sb').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b)return;
@@ -441,42 +453,67 @@ $('sb').addEventListener('click',e=>{
   if(b.dataset.apply){const sel=document.querySelector(`[data-sel="${b.dataset.apply}"]`);if(sel.value==='')return;const o=OPTS[+sel.value];sel.value='';add(b.dataset.apply,o.v,o.l)}
 });
 $('undo').onclick=()=>{
-  const L=visible().slice().sort((a,b)=>b.at-a.at);const x=L.find(x=>x.by===me)||L[0];if(!x)return;
-  logs=logs.filter(y=>y.id!==x.id);render();
-  mutate(d=>{d.logs=d.logs.filter(y=>y.id!==x.id);return c=>!c.logs.some(y=>y.id===x.id)},'geri alma');
+  const L=logs.slice().sort((a,b)=>b.at-a.at);const x=L.find(x=>x.by===me)||L[0];if(!x)return;
+  publish({k:'d',id:uid(),ref:x.id,by:me,at:Date.now()});
 };
 $('reset').onclick=()=>{
   const b=$('reset');
   if(!b.dataset.armed){b.dataset.armed=1;b.textContent='Əminsiniz? Yenidən basın';setTimeout(()=>{delete b.dataset.armed;b.textContent='⟲ Sıfırla'},3000);return}
   delete b.dataset.armed;b.textContent='⟲ Sıfırla';
-  const t=Date.now();
-  mutate(d=>{d.logs=[];d.resetAt=t;return c=>c.resetAt===t},'sıfırlama');
+  const sc={};TEAMS.forEach(t=>sc[t.id]=100);
+  publish({k:'s',id:uid(),at:Date.now(),sc:sc,r:1,by:me});
 };
 $('mode').onclick=()=>{document.body.classList.toggle('screen');const on=document.body.classList.contains('screen');$('mode').textContent=on?'✏️ İdarə rejimi':'📺 Ekran rejimi';try{if(on&&document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});else if(!on&&document.fullscreenElement)document.exitFullscreen().catch(()=>{})}catch(e){}};
-async function poll(){
-  if(!busy){try{apply(await fetchState())}catch(e){if(Date.now()-lastOk>10000)status(false,'Bağlantı yoxdur — yenidən cəhd edilir…')}}
-  setTimeout(poll,document.hidden?10000:POLL_MS);
+
+function parseMsg(m){if(!m||m.event!=='message'||typeof m.message!=='string')return null;try{return JSON.parse(m.message)}catch(e){return null}}
+async function initialLoad(){
+  // 1) local copy
+  try{const L=JSON.parse(localStorage.getItem('vtc-ops-'+TOPIC)||'[]');if(Array.isArray(L))L.forEach(ingest)}catch(e){}
+  const localIds=new Set(Object.keys(ops));
+  refresh();
+  // 2) server backlog (last 12h)
+  let lastId='', serverIds=new Set();
+  const r=await fetch(NTFY+TOPIC+'/json?poll=1&since=all',{cache:'no-store'});
+  if(!r.ok)throw new Error(r.status);
+  const txt=await r.text();
+  txt.split('\n').forEach(line=>{if(!line.trim())return;try{const m=JSON.parse(line);if(m.id)lastId=m.id;const o=parseMsg(m);if(o&&validOp(o)){serverIds.add(o.id);ingest(o)}}catch(e){}});
+  saveLocal();refresh();lastOk=Date.now();
+  // 3) server lost history (12h expiry) but this device remembers it -> re-seed with a snapshot
+  const missing=[...localIds].some(id=>!serverIds.has(id));
+  if(missing&&Object.keys(ops).length){
+    const sc=scores();const now=Date.now();
+    const differs=serverIds.size===0||TEAMS.some(t=>sc[t.id]!==100);
+    if(differs){await publish({k:'s',id:uid(),at:now,sc:sc,by:me+' (bərpa)'})}
+  }
+  return lastId;
 }
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!busy&&started)fetchState().then(apply).catch(()=>{})});
+function connect(since){
+  try{if(es)es.close()}catch(e){}
+  es=new EventSource(NTFY+TOPIC+'/sse'+(since?'?since='+encodeURIComponent(since):''));
+  es.onopen=()=>{connected=true;lastOk=Date.now();status(true,'Canlı · '+me);if(pending.length)flushPending()};
+  es.onmessage=e=>{try{const m=JSON.parse(e.data);lastOk=Date.now();const o=parseMsg(m);if(o&&ingest(o)){saveLocal();refresh()}}catch(x){}};
+  es.onerror=()=>{connected=false;status(false,'Bağlantı bərpa olunur…')};
+}
+async function boot(){
+  status(false,'Qoşulur…');
+  let since='';
+  for(let i=0;i<5;i++){
+    try{since=await initialLoad();break}catch(e){status(false,'Bağlantı yoxdur — yenidən cəhd…');await new Promise(z=>setTimeout(z,3000*(i+1)))}
+  }
+  connect(since||'all');
+}
 async function createBoard(){
-  const b=$('createBtn');b.disabled=true;b.textContent='Yaradılır…';$('serr').textContent='';
-  try{
-    const r=await fetch(BASE,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({logs:[],resetAt:0})});
-    if(!r.ok)throw new Error(r.status);
-    let id=(r.headers.get('Location')||'').split('/').pop()||r.headers.get('X-jsonblob-id')||'';
-    if(!validId(id))throw new Error('no id');
-    setBoard(id);$('setup').classList.add('hidden');showShare();status(false,'Qoşulur…');poll();
-  }catch(e){$('serr').textContent='Yaratmaq alınmadı ('+e.message+'). Bir az sonra yenidən cəhd edin.';b.disabled=false;b.textContent='Yeni tablo yarat'}
+  setBoard(randTopic());$('setup').classList.add('hidden');showShare();boot();
 }
-function showShare(){const u=location.href.split('#')[0]+'#'+BLOB_ID;$('shareUrl').value=u;$('share').classList.remove('hidden')}
+function setBoard(id){TOPIC=id;ls.set('vtc-topic',id);if(location.hash!=='#'+id)history.replaceState(null,'','#'+id)}
+function showShare(){const u=location.href.split('#')[0]+'#'+TOPIC;$('shareUrl').value=u;$('share').classList.remove('hidden')}
 $('createBtn').onclick=createBoard;
 $('copyBtn').onclick=async()=>{try{await navigator.clipboard.writeText($('shareUrl').value);$('copyBtn').textContent='Kopyalandı ✓'}catch(e){$('shareUrl').select()}setTimeout(()=>$('copyBtn').textContent='Kopyala',2000)};
 function start(){
   if(started)return;started=true;
-  render(true);
-  if(!BLOB_ID){status(false,'Tablo yaradılmayıb');$('setup').classList.remove('hidden');return}
-  setBoard(BLOB_ID);showShare();
-  status(false,'Qoşulur…');poll();
+  fold();render(true);
+  if(!TOPIC){status(false,'Tablo yaradılmayıb');$('setup').classList.remove('hidden');return}
+  setBoard(TOPIC);showShare();boot();
 }
 </script>
 </body>

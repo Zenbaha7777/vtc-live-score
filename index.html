@@ -181,6 +181,14 @@ footer{padding:40px 0 60px;text-align:center;color:var(--dim);font-size:13px}
   .f-it{min-width:0;padding:12px 16px;flex:1}
 }
 /* live */
+.setup{background:var(--card);border:1px solid var(--gold);border-radius:20px;padding:24px;margin-bottom:18px;display:flex;flex-direction:column;gap:10px}
+.setup p{color:var(--mute)}
+.setup .err{color:var(--minus);font-size:13px}
+.sharebox{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 16px;margin-bottom:18px;font-size:13px;color:var(--mute);display:flex;flex-direction:column;gap:8px}
+.sharerow{display:flex;gap:8px}
+.sharerow input{flex:1;min-width:0;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:9px 10px;font-size:13px;color:var(--ink)}
+body.screen .sharebox,body.screen .setup{display:none!important}
+
 .gate{position:fixed;inset:0;z-index:100;display:grid;place-items:center;background:radial-gradient(60% 60% at 20% 20%,rgba(255,77,109,.25),transparent),radial-gradient(60% 60% at 80% 80%,rgba(47,184,255,.22),transparent),var(--bg);padding:20px}
 .gate form{width:100%;max-width:380px;background:var(--card);border:1px solid var(--line);border-radius:24px;padding:28px;display:flex;flex-direction:column;gap:12px}
 .gate h2{font-size:24px;margin:10px 0 4px}
@@ -247,6 +255,16 @@ body.screen .bar{height:12px}
 </header>
 <main class="wrap" style="padding-top:24px;padding-bottom:40px">
   <div class="banner hidden" id="banner"></div>
+  <div class="setup hidden" id="setup">
+    <h3 class="disp">Tablonu başladın</h3>
+    <p>Bu ilk girişdir. Xallar üçün ortaq baza yaradın — bir dəfə edilir.</p>
+    <button class="apply" id="createBtn" style="max-width:260px">Yeni tablo yarat</button>
+    <div class="err" id="serr"></div>
+  </div>
+  <div class="sharebox hidden" id="share">
+    <span>🔗 Supervayzerlər üçün link (şifrə ilə birlikdə göndərin):</span>
+    <div class="sharerow"><input id="shareUrl" readonly><button class="btn" id="copyBtn">Kopyala</button></div>
+  </div>
   <div class="sb-grid" id="sb"></div>
   <div class="lbl" style="margin-top:28px">Əməliyyat tarixçəsi</div>
   <div class="log" id="log"></div>
@@ -330,7 +348,7 @@ const ls={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k
 async function sha(t){
   try{const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(t));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return ''}
 }
-function unlock(name){me=name;$('gate').classList.add('hidden');start()}
+function unlock(name){me=name;$('gate').classList.add('hidden');setTimeout(start,0)}
 (function(){const a=ls.get(LS);if(a){try{const o=JSON.parse(a);if(o.h===PW_HASH&&o.n){unlock(o.n);return}}catch(e){}}})();
 $('gateForm').addEventListener('submit',async e=>{
   e.preventDefault();
@@ -343,8 +361,13 @@ $('gateForm').addEventListener('submit',async e=>{
 $('logout').onclick=()=>{ls.del(LS);location.reload()};
 
 // ===== shared state (JSONBlob, polled) =====
-const BLOB_ID='__BLOB_ID__';
-const API='https://jsonblob.com/api/jsonBlob/'+BLOB_ID;
+const BASE='https://jsonblob.com/api/jsonBlob';
+const validId=x=>/^[A-Za-z0-9-]{6,64}$/.test(x||'');
+let BLOB_ID=(location.hash||'').replace(/^#/,'');
+if(!validId(BLOB_ID)){BLOB_ID=ls.get('vtc-board')||''}
+if(!validId(BLOB_ID))BLOB_ID='';
+let API=BASE+'/'+BLOB_ID;
+function setBoard(id){BLOB_ID=id;API=BASE+'/'+id;ls.set('vtc-board',id);if(location.hash!=='#'+id)history.replaceState(null,'','#'+id)}
 const POLL_MS=3000;
 let logs=[], resetAt=0, started=false, busy=false, lastOk=0;
 const visible=()=>logs.filter(x=>x.at>resetAt);
@@ -435,10 +458,24 @@ async function poll(){
   setTimeout(poll,document.hidden?10000:POLL_MS);
 }
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!busy&&started)fetchState().then(apply).catch(()=>{})});
+async function createBoard(){
+  const b=$('createBtn');b.disabled=true;b.textContent='Yaradılır…';$('serr').textContent='';
+  try{
+    const r=await fetch(BASE,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({logs:[],resetAt:0})});
+    if(!r.ok)throw new Error(r.status);
+    let id=(r.headers.get('Location')||'').split('/').pop()||r.headers.get('X-jsonblob-id')||'';
+    if(!validId(id))throw new Error('no id');
+    setBoard(id);$('setup').classList.add('hidden');showShare();status(false,'Qoşulur…');poll();
+  }catch(e){$('serr').textContent='Yaratmaq alınmadı ('+e.message+'). Bir az sonra yenidən cəhd edin.';b.disabled=false;b.textContent='Yeni tablo yarat'}
+}
+function showShare(){const u=location.href.split('#')[0]+'#'+BLOB_ID;$('shareUrl').value=u;$('share').classList.remove('hidden')}
+$('createBtn').onclick=createBoard;
+$('copyBtn').onclick=async()=>{try{await navigator.clipboard.writeText($('shareUrl').value);$('copyBtn').textContent='Kopyalandı ✓'}catch(e){$('shareUrl').select()}setTimeout(()=>$('copyBtn').textContent='Kopyala',2000)};
 function start(){
   if(started)return;started=true;
   render(true);
-  if(BLOB_ID.indexOf('__')===0){status(false,'Baza qoşulmayıb');banner('Baza hələ qoşulmayıb.');return}
+  if(!BLOB_ID){status(false,'Tablo yaradılmayıb');$('setup').classList.remove('hidden');return}
+  setBoard(BLOB_ID);showShare();
   status(false,'Qoşulur…');poll();
 }
 </script>

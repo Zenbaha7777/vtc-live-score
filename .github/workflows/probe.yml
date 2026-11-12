@@ -1,0 +1,19 @@
+name: probe-stores
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          O="https://zenbaha7777.github.io"
+          T="vtc-probe-$RANDOM$RANDOM"
+          echo "=== ntfy publish"
+          curl -s -i -X POST "https://ntfy.sh/$T" -H "Origin: $O" -d '{"k":1}' | grep -i '^HTTP\|access-control\|^{'
+          echo "=== ntfy poll"
+          curl -s -i "https://ntfy.sh/$T/json?poll=1&since=all" -H "Origin: $O" | grep -i '^HTTP\|access-control\|^{'
+          echo "=== ntfy preflight"
+          curl -s -i -X OPTIONS "https://ntfy.sh/$T" -H "Origin: $O" -H "Access-Control-Request-Method: POST" | grep -i '^HTTP\|access-control'
+          echo "=== extendsclass create"
+          curl -s -i -X POST "https://json.extendsclass.com/bin" -H "Origin: $O" -H "Content-Type: application/json" -d '{"logs":[]}' | grep -i '^HTTP\|access-control\|^{' | head
+          echo "=== jsonblob create (plain)"
+          curl -s -o /dev/null -w "%{http_code}\n" -X POST https://jsonblob.com/api/jsonBlob -H "Origin: $O" -H "Content-Type: application/json" -H "Accept: application/json" -d '{}'
